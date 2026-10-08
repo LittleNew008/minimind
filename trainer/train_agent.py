@@ -4,12 +4,12 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
 import re
 import gc
 import json
 import math
 import random
-import signal
 import argparse
 import warnings
 import torch
@@ -23,7 +23,7 @@ from torch.optim.lr_scheduler import CosineAnnealingLR
 from transformers import AutoTokenizer
 from model.model_minimind import MiniMindConfig, MiniMindForCausalLM
 from dataset.lm_dataset import AgentRLDataset
-from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel
+from trainer.trainer_utils import Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, SkipBatchSampler, init_model, LMForRewardModel, safe_math_eval
 from trainer.rollout_engine import create_rollout_engine, compute_per_token_logps
 
 warnings.filterwarnings('ignore')
@@ -54,7 +54,7 @@ UNIT_DATA = {"km_miles": 0.621371, "miles_km": 1.60934, "kg_pounds": 2.20462, "p
 
 # ======== 模拟执行 ========
 MOCK_RESULTS = {
-    "calculate_math": lambda args: {"result": str(eval(str(args.get("expression", "0")).replace("^", "**").replace("×", "*").replace("÷", "/").replace("−", "-").replace("（", "(").replace("）", ")"), {"__builtins__": {}, "math": math}))},
+    "calculate_math": lambda args: {"result": str(safe_math_eval(args.get("expression", "0")))},
     "unit_converter": lambda args: {"result": round(float(args.get("value", 0)) * UNIT_DATA.get(f"{args.get('from_unit', '').lower()}_{args.get('to_unit', '').lower()}", 1), 4)},
     "get_current_weather": lambda args: (lambda w: {"city": args.get("location"), "temperature": w[0], "humidity": "65%", "condition": w[1]})(WEATHER_DATA.get(args.get("location"), ("22°C", "晴"))),
     "get_current_time": lambda args: {"datetime": TIME_DATA.get(args.get("timezone", "Asia/Shanghai"), "2025-03-07 14:30:00"), "timezone": args.get("timezone", "Asia/Shanghai")},
@@ -84,14 +84,9 @@ def execute_tool(name, args):
     fn = MOCK_RESULTS.get(name)
     if not fn: return None
     try:
-        signal.signal(signal.SIGALRM, lambda *_: (_ for _ in ()).throw(TimeoutError()))
-        signal.alarm(1)
         return fn(args)
-    except:
+    except Exception:
         return None
-    finally:
-        try: signal.alarm(0)
-        except: pass
 
 # ======== 多轮 Rollout ========
 def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_new_tokens=256, thinking_ratio=0.5, device="cuda"):
@@ -105,34 +100,33 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
     open_thinking = random.random() < thinking_ratio
     for turn in range(max_turns):
         context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, tools=tools, open_thinking=open_thinking)
-        inputs = tokenizer(context, return_tensors="pt", add_special_tokens=False).to(device)
-        context_ids = inputs["input_ids"][0].tolist()
         if prompt_ids is None:
-            prompt_ids = context_ids
+            prompt_ids = tokenizer(context, add_special_tokens=False)["input_ids"]
+        input_ids = torch.tensor([prompt_ids + response_ids], device=device)
         rollout_result = rollout_engine.rollout(
-            prompt_ids=inputs["input_ids"],
-            attention_mask=inputs["attention_mask"],
+            prompt_ids=input_ids,
+            attention_mask=torch.ones_like(input_ids),
             num_generations=1,
             max_new_tokens=max_new_tokens,
             temperature=0.8,
         )
-        new_ids = rollout_result.completion_ids[0].tolist()
-        new_logps = rollout_result.per_token_logps[0].tolist()
-        if len(new_ids) != len(new_logps): Logger(f"rollout token/logprob length mismatch: {len(new_ids)} vs {len(new_logps)}")
-        pairs = [(t, lp) for t, lp in zip(new_ids, new_logps) if t != tokenizer.pad_token_id and t != tokenizer.eos_token_id]
-        new_ids = [t for t, _ in pairs]
-        new_logps = [lp for _, lp in pairs]
+        valid_len = int(rollout_result.completion_mask[0].sum().item())
+        new_ids = rollout_result.completion_ids[0, :valid_len].tolist()
+        new_logps = rollout_result.per_token_logps[0, :valid_len].tolist()
+        if len(new_ids) != len(new_logps):
+            raise RuntimeError(f"rollout token/logprob length mismatch: {len(new_ids)} vs {len(new_logps)}")
         new_text = rollout_result.completions[0]
         all_outputs.append(new_text)
         response_ids.extend(new_ids)
-        response_mask.extend([1] * len(new_ids))
+        response_mask.extend([int(t != tokenizer.eos_token_id) for t in new_ids])
         response_old_logps.extend(new_logps)
         final_context = context + new_text
         calls = parse_tool_calls(new_text)
         if not calls:
             break
         unfinished = turn == max_turns - 1
-        messages.append({"role": "assistant", "content": new_text})
+        assistant_message = {"role": "assistant", "content": new_text}
+        messages.append(assistant_message)
         for call in calls:
             name, raw = call.get("name", ""), call.get("arguments", {})
             if isinstance(raw, str):
@@ -142,10 +136,17 @@ def rollout_single(rollout_engine, tokenizer, messages, tools, max_turns=3, max_
             result_str = (json.dumps(result, ensure_ascii=False) if result else '{"error": "tool not found"}')[:2048]  # 防止天文数字撑爆tokenizer
             messages.append({"role": "tool", "content": result_str})
 
+        marker = f"<|agent_observation_{id(messages)}_{len(response_ids)}|>"
+        assistant_message["content"] += marker
+        marked_context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not unfinished, tools=tools, open_thinking=open_thinking)
+        assistant_message["content"] = new_text
+        _, found, observation = marked_context.partition(marker)
+        if not found:
+            raise RuntimeError("chat template did not preserve the assistant content boundary")
+        obs_delta = tokenizer(observation, add_special_tokens=False)["input_ids"]
+        if new_ids and new_ids[-1] == tokenizer.eos_token_id and obs_delta[:1] == [tokenizer.eos_token_id]:
+            obs_delta = obs_delta[1:]
         observe_context = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=not unfinished, tools=tools, open_thinking=open_thinking)
-        observe_ids = tokenizer(observe_context, return_tensors="pt", add_special_tokens=False)["input_ids"][0].tolist()
-        current_len = len(prompt_ids) + len(response_ids)
-        obs_delta = observe_ids[current_len:]
         response_ids.extend(obs_delta)
         response_mask.extend([0] * len(obs_delta))
         response_old_logps.extend([0.0] * len(obs_delta))
@@ -239,12 +240,10 @@ def calculate_rewards(prompts, completions, gt_batch, tools_batch, num_gen, rewa
 
 # ================================ 工具与 Reward = End ================================
 def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model=None, start_step=0, wandb=None, use_sglang=False):
-    last_step = start_step
     for step, batch in enumerate(loader, start=start_step + 1):
         messages_batch = batch['messages']
         tools_batch = batch['tools']
         gt_batch = batch['gt']
-        last_step = step
 
         with torch.no_grad():
             completions, contexts, prompt_ids_batch, response_ids_batch, response_masks_batch, response_old_logps_batch, turn_outputs_batch, unfinished_batch = rollout_batch(rollout_engine, tokenizer, messages_batch, tools_batch, args.num_generations, max_turns=3, max_new_tokens=args.max_gen_len, thinking_ratio=args.thinking_ratio, device=args.device)
@@ -267,16 +266,18 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         prompt_lens = torch.tensor([prompt_len for _, _, prompt_len, _ in packed_samples], device=args.device)
         full_response_masks = torch.tensor([mask + [0] * (max_len - len(mask)) for _, mask, _, _ in packed_samples], device=args.device, dtype=torch.float32)
         old_per_token_logps = torch.tensor([old_logps + [0.0] * ((max_len - 1) - len(old_logps)) for _, _, _, old_logps in packed_samples], device=args.device, dtype=torch.float32)
+        full_mask = (torch.arange(max_len, device=args.device).unsqueeze(0) < seq_lens.unsqueeze(1)).long()
 
-        model_unwrapped = model.module if isinstance(model, DistributedDataParallel) else model
+        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
+
         with autocast_ctx:
-            res = model_unwrapped(input_ids)
+            res = model(input_ids, attention_mask=full_mask)
             aux_loss = res.aux_loss if lm_config.use_moe else torch.tensor(0.0, device=args.device)
             logits = res.logits[:, :-1, :]
             per_token_logps = F.log_softmax(logits, dim=-1).gather(2, input_ids[:, 1:].unsqueeze(-1)).squeeze(-1)
 
         with torch.no_grad():
-            ref_per_token_logps = compute_per_token_logps(ref_model, input_ids, input_ids.size(1) - 1)
+            ref_per_token_logps = compute_per_token_logps(ref_model, input_ids, input_ids.size(1) - 1, attention_mask=full_mask)
 
         completion_mask = full_response_masks[:, 1:]
         is_eos = (input_ids[:, 1:] == tokenizer.eos_token_id) & completion_mask.bool()
@@ -287,7 +288,6 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         completion_mask = completion_mask * (pos <= eos_idx.unsqueeze(1)).float()
         token_counts = completion_mask.sum(dim=1)
         valid_rows = token_counts > 0
-        rewards = calculate_rewards(prompts, completions, gt_batch, tools_batch, args.num_generations, reward_model, device=args.device, turn_outputs_batch=turn_outputs_batch, unfinished_batch=unfinished_batch)
 
         if args.debug_mode and is_main_process() and step % args.debug_interval == 0:
             for i in range(len(messages_batch)):
@@ -329,10 +329,9 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
         loss = (policy_loss + aux_loss) / args.accumulation_steps
         loss.backward()
 
-        if step % args.accumulation_steps == 0:
+        if step % args.accumulation_steps == 0 or step == iters:
             if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
             optimizer.step(); scheduler.step(); optimizer.zero_grad()
-            if is_main_process() and step % args.save_interval == 0: rollout_engine.update_policy(model)
 
         if step % args.log_interval == 0 or step == iters:
             pl = loss.item() * args.accumulation_steps
@@ -359,13 +358,10 @@ def rl_train_epoch(epoch, loader, iters, rollout_engine, ref_model, reward_model
             model.train()
             del state_dict
 
+        if step % args.save_interval == 0 or step == iters: rollout_engine.update_policy(model)
+
         del per_token_logps, ref_per_token_logps
         del completions, rewards, grouped_rewards, mean_r, std_r, advantages, completion_mask
-
-    if last_step > start_step and last_step % args.accumulation_steps != 0:
-        if args.grad_clip > 0: torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
-        optimizer.step(); scheduler.step(); optimizer.zero_grad()
-        if is_main_process() and last_step % args.save_interval == 0: rollout_engine.update_policy(model)
 
 
 if __name__ == "__main__":
@@ -403,7 +399,7 @@ if __name__ == "__main__":
     parser.add_argument("--debug_interval", type=int, default=20, help="调试日志间隔")
     parser.add_argument("--thinking_ratio", type=float, default=0.1, help="按概率开启thinking（0.0~1.0）")
     parser.add_argument("--reward_model_path", type=str, default="../../internlm2-1_8b-reward", help="Reward模型路径")
-    parser.add_argument("--rollout_engine", type=str, default="sglang", choices=["torch", "sglang"], help="rollout引擎类型")
+    parser.add_argument("--rollout_engine", type=str, default="torch", choices=["torch", "sglang"], help="rollout引擎类型")
     parser.add_argument("--sglang_base_url", type=str, default="http://localhost:8998", help="SGLang服务器URL")
     parser.add_argument("--sglang_model_path", type=str, default="../model", help="SGLang tokenizer路径")
     parser.add_argument("--sglang_shared_path", type=str, default="./sglang_ckpt_agent", help="SGLang共享存储路径")
@@ -468,9 +464,9 @@ if __name__ == "__main__":
         model = torch.compile(model)
         Logger('torch.compile enabled')
     if dist.is_initialized():
-        model._ddp_params_and_buffers_to_ignore = {"freqs_cos", "freqs_sin"}
-        model = DistributedDataParallel(model, device_ids=[local_rank])
-    if is_main_process(): rollout_engine.update_policy(model)
+        # 同 train_ppo：RoPE buffer 各 rank 一致，每步广播纯属浪费
+        model = DistributedDataParallel(model, device_ids=[local_rank], broadcast_buffers=False)
+    rollout_engine.update_policy(model)
 
     for epoch in range(start_epoch, args.epochs):
         train_sampler and train_sampler.set_epoch(epoch)
@@ -484,4 +480,6 @@ if __name__ == "__main__":
         else:
             rl_train_epoch(epoch, loader, len(loader), rollout_engine, ref_model, reward_model, 0, wandb, use_sglang = (args.rollout_engine == "sglang"))
 
-    if dist.is_initialized(): dist.destroy_process_group()
+    if dist.is_initialized():
+        dist.barrier()
+        dist.destroy_process_group()
